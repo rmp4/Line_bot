@@ -3,8 +3,14 @@
 const line = require('@line/bot-sdk');
 const express = require('express');
 const async = require('async');
-var request = require('request');
-
+const request = require('request');
+const redis = require('redis');
+const Promise = require("bluebird");
+const redis_client = Promise.promisifyAll(redis.createClient(  {
+  port      : process.env.REDIS_PORT,               // replace with your port
+  host      : process.env.REDIS_URL,        // replace with your hostanme or IP address
+  password  : process.env.REDIS_PASSWORD,    // replace with your password
+}));
 // base URL for webhook server
 let baseURL = process.env.BASE_URL;
 
@@ -17,10 +23,16 @@ const config = {
 // create LINE SDK client
 const client = new line.Client(config);
 
+//check redis clinet connect 
+redis_client.on('error',(err)=> {
+  console.log(`Error ${err}`)
+  throw new Error.message(err)
+})
 // create Express app
 const app = express();
-
+var user_id='';
 app.use('/static', express.static('static'));
+app.get('/callback', (req, res) => res.end(`I'm listening. Please access with POST.`));
 
 app.post('/callback', line.middleware(config), (req, res) => {
   if(req.body.destination) {
@@ -52,7 +64,13 @@ function handleEvent(event) {
           throw new ErrorEvent(`Unkonw message: ${JSON.stringify(message)}`)
       }
     case 'follow':
-      return replyText(event.replyToken, '你好 我目前還在測試中，目前先以台積電的股票做為參考操作');
+      return replyText(event.replyToken, '你好 朋友~還請你先設定你');
+    case 'postback':
+      let data = event.postback.data;
+      if (data === 'Setting') {
+        redis_client.hset(user_id.userId,'status','setting')
+      }
+      return replyText(event.replyToken, `已經進入設定模式 \n 輸入#加上股票代碼來建立股票 \n EX: #2330`);
   }
 }
 const replyText = (token, texts) => {
@@ -66,47 +84,104 @@ async function handleText(message,replyToken,source){
   console.log(`Echo messge to ${replyToken}: ${message.text}`);
   const buttonsImageURL = `${baseURL}/static/fugle.png`;
   var rc
-  switch(message.text){
-    case '顯示股價':
-      rc = await getFCNTdata('https://www.fugle.tw/api/v1/data/new_content/FCNT000099?symbol_id=2330')
-      let lastday_info= JSON.parse(rc).rawContent.day.pop();
-      console.log(lastday_info)
-      let info = `名稱: 台積電 \n代號: 2330 \n成交價格: ${lastday_info.close} \n漲跌: ${lastday_info.change} \n漲跌幅: ${lastday_info.change_rate}% \n成交量: ${lastday_info.volumeOrAmount} `
-      return replyText(replyToken,`${info}`)
-    case '顯示新聞':
-        rc= await getFCNTdata('https://www.fugle.tw/api/v1/data/new_content/FCNT000050?symbol_id=2330')
-        let NEWS= JSON.parse(rc).rawContent.map(info=>{
-        return info.title + "\n" + info.url
-      })
-      return replyText(replyToken,NEWS.join('\n\n'))
-    case '顯示PTT新聞':
-        rc = await getFCNTdata('https://www.fugle.tw/api/v1/data/new_content/FCNT000073?symbol_id=2330')
-        let PTT_NEWS= JSON.parse(rc).rawContent.map(info=>{
-        return info.title + "\n" + info.url
-      })
-      console.log(PTT_NEWS)
-      return replyText(replyToken,PTT_NEWS.join('\n\n'))
-    default:
-      return client.replyMessage(
-        replyToken,
-        {
-          type: 'template',
-          altText: 'Buttons alt text',
-          template: {
-            type: 'buttons',
-            thumbnailImageUrl: buttonsImageURL,
-            title: '功能',
-            text: '目前先以台積電的股票做為參考操作 \n股票功能',
-            actions: [
-              { label: '股價', type: 'message', text: '顯示股價' },
-              { label: '新聞', type: 'message', data: 'news' ,text:'顯示新聞' },
-              { label: 'PTT新聞', type: 'message' ,text:'顯示PTT新聞' },
-            ],
-          },
-        }
-      );
+  user_id = await client.getProfile(source.userId)
+  console.log(user_id)
+  let status = await redis_client.hgetAsync(user_id.userId,'status');
+  console.log(status)
+  if(!status)
+  {
+    redis_client.hset(user_id.userId,'status','setting')
+    return replyText(replyToken,'請先設定股票 \n 輸入#加上股票代碼來建立股票 \n EX: #2330')
   }
-  return replyText(replyToken,message.text)
+
+  switch(status){
+    case 'setting':
+      if(message.text[0]==='#')
+      {
+      //stock setting need to write to redis
+      //check stock
+        let stock_id = message.text.slice(1,5)
+        rc = await getFCNTdata(`https://www.fugle.tw/api/v1/data/new_content/FCNT000001?symbol_id=${stock_id}`)
+        if(JSON.parse(rc).rawContent)
+        {
+          let info = JSON.parse(rc).rawContent.shortName
+          redis_client.hmset(user_id.userId,'status','report' ,'stock',stock_id)
+          return replyText(replyToken,`設定股票 ${info} \n\n請隨便對我輸入文字就可以知道我的功能喔~`)
+        }
+        else
+        return replyText(replyToken,`找不到這支股票`)
+      }
+      else{
+        switch(message.text){
+          default:
+            return replyText(replyToken,'請先設定股票 \n 輸入#加上股票代碼來建立股票 \n EX: #2330')
+        }
+      }
+  case 'report':
+      let stock_id = await redis_client.hgetAsync(user_id.userId,'stock');
+      console.log(stock_id)
+      if(stock_id){
+        switch(message.text){
+          case 'status':
+            let status = await redis_client.hgetAsync(user_id.userId,'status');
+            console.log("User ID: " + JSON.stringify(test));
+            return replyText(replyToken,`${test}`)
+          case '顯示股價':
+            let info = []
+            rc = await getFCNTdata(`https://www.fugle.tw/api/v1/data/new_content/FCNT000001?symbol_id=${stock_id}`)
+            let stock_info =JSON.parse(rc).rawContent
+            info.push(`名稱: ${stock_info.shortName} \n代碼: ${stock_info.symbolId}`)
+            rc = await getFCNTdata(`https://www.fugle.tw/api/v1/data/new_content/FCNT000099?symbol_id=${stock_id}`)
+            let lastday_info= JSON.parse(rc).rawContent.day.pop();
+            info.push(`\n日期: ${lastday_info.date} \n成交價格: ${lastday_info.close} \n漲跌: ${lastday_info.change} \n漲跌幅: ${lastday_info.change_rate}% \n成交量: ${lastday_info.volumeOrAmount}`)
+            return replyText(replyToken,`${info}`)
+          case '顯示新聞':
+              rc= await getFCNTdata(`https://www.fugle.tw/api/v1/data/new_content/FCNT000050?symbol_id=${stock_id}`)
+              if(JSON.parse(rc).rawContent){
+                let NEWS= JSON.parse(rc).rawContent.map(info=>{
+                  return info.title + "\n" + info.url
+                })
+                return replyText(replyToken,NEWS.join('\n\n'))
+              }
+              else{
+                return replyText(replyToken,'找不到相關的新聞')
+              }
+          case '顯示PTT新聞':
+              rc = await getFCNTdata(`https://www.fugle.tw/api/v1/data/new_content/FCNT000073?symbol_id=${stock_id}`)
+              if(JSON.parse(rc).rawContent){
+                let PTT_NEWS= JSON.parse(rc).rawContent.map(info=>{
+                  return info.title + "\n" + info.url
+                })            
+                return replyText(replyToken,PTT_NEWS.join('\n\n'))
+              }
+              else{
+                return replyText(replyToken,'找不到相關的PTT新聞')
+              }
+          default:
+            return client.replyMessage(
+              replyToken,
+              {
+                type: 'template',
+                altText: 'Buttons alt text',
+                template: {
+                  type: 'buttons',
+                  thumbnailImageUrl: buttonsImageURL,
+                  title: '功能',
+                  text: '可以透過下列功能才操作我喔~ \n股票功能',
+                  actions: [
+                    { label: '股價', type: 'message', text: '顯示股價' },
+                    { label: '新聞', type: 'message', data: 'news' ,text:'顯示新聞' },
+                    { label: 'PTT新聞', type: 'message' ,text:'顯示PTT新聞' },
+                    {label :'設定股票',type: 'postback', data: 'Setting'},
+                  ],
+                },
+              }
+            );
+        }
+      }
+  default:      
+      return replyText(replyToken,message.text)
+  }
 }
 
 function getFCNTdata(url) {
